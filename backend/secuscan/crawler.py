@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from html.parser import HTMLParser
 import re
 from typing import Any, Dict, List
@@ -10,6 +11,8 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 import httpx
 
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class _SurfaceParser(HTMLParser):
@@ -85,36 +88,69 @@ async def crawl_target(
 ) -> Dict[str, Any]:
     """Fetch a target and normalize discovered links/forms/scripts/API hints."""
     headers = _build_headers(extra_headers)
+    tls_verify = getattr(settings, "tls_verify", True) and getattr(settings, "verify_ssl", True)
+
+    seed_parsed = urlparse(url)
+    seed_hostname = (seed_parsed.hostname or "").lower()
+
+    current_url = url
+    history: List[httpx.Response] = []
+    redirect_count = 0
+
     async with httpx.AsyncClient(
-        follow_redirects=True,
-        max_redirects=max_redirects,
+        follow_redirects=False,
         timeout=timeout,
         headers=headers,
         cookies=cookies or {},
-        verify=settings.verify_ssl,
+        verify=tls_verify,
     ) as client:
-        async with client.stream("GET", url) as response:
-            # Check Content-Length header if present
-            content_length = response.headers.get("content-length")
-            if content_length:
-                try:
-                    cl_val = int(content_length)
-                except ValueError:
-                    cl_val = 0
-                if cl_val > max_size:
-                    raise ValueError(f"Response size exceeds limit of {max_size} bytes")
+        while True:
+            async with client.stream("GET", current_url) as response:
+                # Check Content-Length header if present
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        cl_val = int(content_length)
+                    except ValueError:
+                        cl_val = 0
+                    if cl_val > max_size:
+                        raise ValueError(f"Response size exceeds limit of {max_size} bytes")
 
-            # Read response in chunks to enforce size limit
-            body_chunks = []
-            bytes_read = 0
-            async for chunk in response.aiter_bytes():
-                bytes_read += len(chunk)
-                if bytes_read > max_size:
-                    raise ValueError(f"Response size exceeds limit of {max_size} bytes")
-                body_chunks.append(chunk)
+                # Read response in chunks to enforce size limit
+                body_chunks = []
+                bytes_read = 0
+                async for chunk in response.aiter_bytes():
+                    bytes_read += len(chunk)
+                    if bytes_read > max_size:
+                        raise ValueError(f"Response size exceeds limit of {max_size} bytes")
+                    body_chunks.append(chunk)
 
-            body_bytes = b"".join(body_chunks)
-            body = body_bytes.decode("utf-8", errors="replace")
+                body_bytes = b"".join(body_chunks)
+                body = body_bytes.decode("utf-8", errors="replace")
+
+            # Check if redirect and process same-host policy
+            if response.is_redirect and "location" in response.headers and redirect_count < max_redirects:
+                location = response.headers["location"]
+                next_url = urljoin(current_url, location)
+                next_hostname = (urlparse(next_url).hostname or "").lower()
+
+                if seed_hostname and next_hostname and next_hostname != seed_hostname:
+                    logger.warning(
+                        "Crawler redirect blocked due to host mismatch: %s -> %s (seed host: %s, redirect host: %s)",
+                        current_url,
+                        next_url,
+                        seed_hostname,
+                        next_hostname,
+                    )
+                    break
+
+                history.append(response)
+                current_url = next_url
+                redirect_count += 1
+            else:
+                break
+
+    response.history = history
     parser = _SurfaceParser()
     parser.feed(body)
 
