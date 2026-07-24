@@ -86,7 +86,15 @@ async def crawl_target(
     max_redirects: int = 10,
     max_size: int = 5 * 1024 * 1024,
 ) -> Dict[str, Any]:
-    """Fetch a target and normalize discovered links/forms/scripts/API hints."""
+    """Fetch a target and normalize discovered links/forms/scripts/API hints.
+
+    Redirect Policy & Security Semantics:
+    - Enforces configurable TLS certificate verification (via ``SECUSCAN_TLS_VERIFY``).
+    - Only same-host HTTP/HTTPS redirects relative to the original seed URL host are followed.
+    - Cross-host redirects (different target domain/hostname) or non-HTTP/HTTPS schemes
+      (e.g., ``javascript:``, ``file:``) are blocked and logged to mitigate MITM/SSRF.
+    - Redirect loops or chains exceeding ``max_redirects`` raise ``httpx.TooManyRedirects``.
+    """
     headers = _build_headers(extra_headers)
     tls_verify = getattr(settings, "tls_verify", True) and getattr(settings, "verify_ssl", True)
 
@@ -129,12 +137,27 @@ async def crawl_target(
                 body = body_bytes.decode("utf-8", errors="replace")
 
             # Check if redirect and process same-host policy
-            if response.is_redirect and "location" in response.headers and redirect_count < max_redirects:
+            if response.is_redirect and "location" in response.headers:
+                if redirect_count >= max_redirects:
+                    raise httpx.TooManyRedirects(
+                        f"Too many redirects (max_redirects={max_redirects})",
+                        request=httpx.Request("GET", current_url),
+                    )
                 location = response.headers["location"]
                 next_url = urljoin(current_url, location)
-                next_hostname = (urlparse(next_url).hostname or "").lower()
+                next_parsed = urlparse(next_url)
+                next_scheme = (next_parsed.scheme or "").lower()
+                next_hostname = (next_parsed.hostname or "").lower()
 
-                if seed_hostname and next_hostname and next_hostname != seed_hostname:
+                if next_scheme not in {"http", "https"} or not next_hostname:
+                    logger.warning(
+                        "Crawler redirect blocked due to unsupported/invalid Location: %s -> %s",
+                        current_url,
+                        next_url,
+                    )
+                    break
+
+                if seed_hostname and next_hostname != seed_hostname:
                     logger.warning(
                         "Crawler redirect blocked due to host mismatch: %s -> %s (seed host: %s, redirect host: %s)",
                         current_url,
